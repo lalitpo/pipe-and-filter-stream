@@ -84,9 +84,6 @@ object PipeAndFilterStream extends App {
     FlowShape(dispatchPackages.in, mergePackages.out)
   })
 
-
-
-
   private val sink: Sink[Package, Future[Done]] = Sink.foreach(packageInfo => {
     val message = s"Package Name: ${packageInfo.name}," +
       s" Stars: ${packageInfo.stars}," +
