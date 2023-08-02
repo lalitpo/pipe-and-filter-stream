@@ -1,10 +1,10 @@
 import akka.actor.ActorSystem
-import akka.stream.scaladsl.{Balance, Flow, GraphDSL, Merge, Sink, Source}
-import akka.stream.{ActorMaterializer, FlowShape, OverflowStrategy, ThrottleMode}
+import akka.stream.scaladsl.{Balance, Broadcast, Flow, GraphDSL, Merge, Sink, Source}
+import akka.stream.{ActorMaterializer, FlowShape, Materializer, OverflowStrategy, ThrottleMode}
 import akka.{Done, NotUsed}
 import ujson.Obj
 
-import java.io.{File, FileInputStream}
+import java.io.{File, FileInputStream, PrintWriter}
 import java.util.zip.GZIPInputStream
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration.DurationInt
@@ -12,19 +12,19 @@ import scala.concurrent.{ExecutionContextExecutor, Future}
 
 case class NpmPackage(pack: String)
 
-case class Package(name: String, stars: Double, test: Double, downloads: Double, releaseFrequency: Double)
+case class Package(name: String, stars: Double, test: Double, releases: Int, commitSum: Int)
 
 object PipeAndFilterStream extends App {
 
 
-  implicit val actorSystem: ActorSystem = ActorSystem("Assignment_1-Akka_Streams")
-  implicit val materializer: ActorMaterializer = ActorMaterializer()
-  implicit val executionContext: ExecutionContextExecutor = materializer.executionContext
+  private implicit val actorSystem: ActorSystem = ActorSystem("Assignment_1-Akka_Streams")
+  private implicit val materializer: Materializer = ActorMaterializer()
+  private implicit val executionContext: ExecutionContextExecutor = materializer.executionContext
 
 
-  val packageList: ListBuffer[NpmPackage] = new ListBuffer[NpmPackage]()
+  private val packageList: ListBuffer[NpmPackage] = new ListBuffer[NpmPackage]()
 
-  val packageStream = new GZIPInputStream(new FileInputStream(new File("src/main/resources/packages.txt.gz")))
+  private val packageStream = new GZIPInputStream(new FileInputStream(new File("src/main/resources/packages.txt.gz")))
 
   /*
   Each line in the compressed file contains the name of a package,
@@ -34,47 +34,48 @@ object PipeAndFilterStream extends App {
   }
 
   //the packages are converted into a Source to start the streaming process
-  val source: Source[NpmPackage, NotUsed] = Source(packageList.toList)
+  private val source: Source[NpmPackage, NotUsed] = Source(packageList.toList)
 
   //Stream buffered into source stream with a maximum capacity of 25 packages with a backpressure strategy.
-  val sourceBuff: Source[NpmPackage, NotUsed] = source.buffer(25, OverflowStrategy.backpressure)
+  private val sourceBuff: Source[NpmPackage, NotUsed] = source.buffer(25, OverflowStrategy.backpressure)
 
-  val extractionProcess: Flow[NpmPackage, Package, NotUsed] = Flow[NpmPackage].map(item => {
+  private val extractionProcess: Flow[NpmPackage, Package, NotUsed] = Flow[NpmPackage].map(item => {
     val packName = item.pack
     val packageContent = apiRequest(packName)
     val name = packageContent("collected")("metadata")("name").str
     val starsCount = packageContent("collected")("github")("starsCount").num
     val test = packageContent("evaluation")("quality")("tests").num
-    val downloads = packageContent("evaluation")("popularity")("downloadsCount").num
-    val releaseFrequency = packageContent("evaluation")("maintenance")("releasesFrequency").num
-    Package(name, starsCount, test, downloads, releaseFrequency)
+    val releaseCount = packageContent("collected")("metadata")("releases").arr.length
+    val top3ContribCommits = packageContent("collected")("github")("contributors").arr.sortBy(_.obj("commitsCount").num)(Ordering[Double].reverse).take(3)
+    val commitSum = top3ContribCommits.map(_("commitsCount").num).sum.intValue()
+
+    Package(name, starsCount, test, releaseCount, commitSum)
   })
 
   private val pipeline: Flow[Package, Package, NotUsed] = Flow[Package].filter(packData => {
     packData.stars > 20 &&
       packData.test > 0.5 &&
-      packData.downloads > 100 &&
-      packData.releaseFrequency > 0.2
+      packData.releases > 2 &&
+      packData.commitSum > 150
   }
   )
 
   /*
   * Keeping the number of API requests under control and not to stress the NPMS repository,
-  Streaming one package each 3 seconds */
+  Streaming one package every 2 seconds */
   private val throttlingFlow: Flow[NpmPackage, NpmPackage, NotUsed] = Flow[NpmPackage].throttle(
     // cap on the number of elements allowed
     elements = 1,
     // Interval slot
-    per = 3.second,
+    per = 2.second,
     maximumBurst = 0,
-    // stream will collapse if exceeding the number of elements /
     mode = ThrottleMode.Shaping
   )
 
   private val parallelStage: Flow[Package, Package, NotUsed] = Flow.fromGraph(GraphDSL.create() { implicit builder =>
     import GraphDSL.Implicits.*
 
-    val dispatchPackages = builder.add(Balance[Package](3))
+    val dispatchPackages = builder.add(Broadcast[Package](3))
     val mergePackages = builder.add(Merge[Package](3))
     dispatchPackages.out(0) ~> pipeline ~> mergePackages.in(0)
     dispatchPackages.out(1) ~> pipeline ~> mergePackages.in(1)
@@ -83,9 +84,25 @@ object PipeAndFilterStream extends App {
     FlowShape(dispatchPackages.in, mergePackages.out)
   })
 
+
+
+
   private val sink: Sink[Package, Future[Done]] = Sink.foreach(packageInfo => {
-    println(s"Package Name: ${packageInfo.name}, Stars: ${packageInfo.stars}, TestCoverage: ${packageInfo.test}, Downloads: ${packageInfo.downloads}, Release Frequency: ${packageInfo.releaseFrequency}")
+    val message = s"Package Name: ${packageInfo.name}," +
+      s" Stars: ${packageInfo.stars}," +
+      s" TestCoverage: ${packageInfo.test}," +
+      s" Release Count: ${packageInfo.releases}," +
+      s" Commits Count: ${packageInfo.commitSum}"
+    println(message)
+    writeToLogFile(message)
   })
+
+  // Function to store standard outputs in an external file
+  private def writeToLogFile(message: String): Unit = {
+    val writer = new PrintWriter(new java.io.FileWriter("Result.txt", true))
+    writer.println(message)
+    writer.close()
+  }
 
   private val runnableGraph = sourceBuff
     .via(throttlingFlow)
@@ -98,8 +115,7 @@ object PipeAndFilterStream extends App {
 
   // Requests a package to the API and returns the information about that package
   // Change this code at your convenience
-  def apiRequest(pack: String) = {
-    println(s"Analysing $pack")
+  private def apiRequest(pack: String) = {
 
     val url = s"https://api.npms.io/v2/package/$pack"
     val response = requests.get(url)
