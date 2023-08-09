@@ -46,6 +46,7 @@ object PipeAndFilterStream extends App {
     val starsCount = packageContent("collected")("github")("starsCount").num
     val test = packageContent("evaluation")("quality")("tests").num
     val releaseCount = packageContent("collected")("metadata")("releases").arr.length
+    //Sorting commitCounts and then picking top-3 commits count
     val top3ContribCommits = packageContent("collected")("github")("contributors").arr.sortBy(_.obj("commitsCount").num)(Ordering[Double].reverse).take(3)
     val commitSum = top3ContribCommits.map(_("commitsCount").num).sum.intValue()
 
